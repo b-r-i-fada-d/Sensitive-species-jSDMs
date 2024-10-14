@@ -1,3 +1,8 @@
+"""CoordAlign - A tool to assign mean values to survey coordinates that do not fall
+perfectly on the coordinate grid of a measured spatial variable.
+
+Author: T.D. Medina
+"""
 
 import argparse
 from itertools import product
@@ -36,6 +41,7 @@ class CustomHelp(argparse.HelpFormatter):
 
 
 def read_coord_data(file_path, variable_name, year, month):
+    """Read variable data."""
     coord_data = pd.read_csv(file_path, sep=",")
     coord_data.set_index(["Year", "Month"], inplace=True)
     coord_data = coord_data.loc[idx[year, month],].reset_index(drop=True)
@@ -52,11 +58,13 @@ def read_coord_data(file_path, variable_name, year, month):
 
 
 def read_station_table(file_path, index_column=0):
+    """Read survey positions."""
     station_table = pd.read_csv(file_path, index_col=index_column)
     return station_table
 
 
-def find_closest(station_table, coordinate_data, variable_name):
+def average_closest(station_table, coordinate_data, variable_name):
+    """Find the coordinate grid tile of each survey coordinate and assign mean value."""
     results = []
     warns = []
     for coordinate in station_table.itertuples():
@@ -102,7 +110,7 @@ def main(station_data_file, measurement_data_file, variable_name,
     stations = read_station_table(station_data_file, station_index_col)
     data = read_coord_data(measurement_data_file, variable_name, measurement_data_year,
                            measurement_data_month)
-    closest, warns = find_closest(stations, data, variable_name=variable_name)
+    closest, warns = average_closest(stations, data, variable_name=variable_name)
     stations = stations.merge(closest.drop(["lon", "lat"], axis=1),
                               left_index=True, right_index=True)
     stations.to_csv(".".join([output_prefix, output_suffix, "csv"]), index=True)
@@ -166,6 +174,3 @@ if __name__ == '__main__':
     args = parser.parse_args()
 
     results = main(**vars(args))
-    # data = read_coord_data("/home/tyler/Downloads/SBT.csv", 2022, 6)
-    # stations = read_station_table("/home/tyler/Downloads/station_index.csv", 2)
-
