@@ -5,6 +5,7 @@ Author: T.D. Medina
 """
 
 import argparse
+from functools import partial
 from itertools import product, batched
 from multiprocessing import set_start_method, Pool
 from pathlib import Path
@@ -139,15 +140,16 @@ def _average_closest_multiprocess(station_table, coordinate_data, variable_name,
     if subtask_length is None:
         subtask_length = len(coordinates) // 8 + 1
     coordinates = batched(coordinates, subtask_length)
-    # station_table = SharedPandasDataFrame(station_table)
     try:
         coordinate_data = SharedPandasDataFrame(coordinate_data)
         lonlat = {axis: SharedPandasDataFrame(frame) for axis, frame in lonlat.items()}
-        args = [[sub_coords, coordinate_data, lonlat, variable_name]
-                for sub_coords in coordinates]
 
         with Pool() as pool:
-            results = pool.starmap(_average_closest_subtask, args)
+            func = partial(_average_closest_subtask,
+                           coord_table=coordinate_data,
+                           lonlat=lonlat,
+                           variable_name=variable_name)
+            results = list(pool.imap_unordered(func, coordinates))
     finally:
         coordinate_data.unlink()
         for thing in lonlat.values():
@@ -168,7 +170,7 @@ def average_closest(station_table, coordinate_data, variable_name):
     lonlat = {axis: coordinate_data.index.unique(axis).to_series() for axis in _AXES}
     for i, coordinate in tqdm(enumerate(station_table.reset_index().itertuples()),
                               desc=f"Locating stations", total=total,
-                              unit="Station "):
+                              unit="Station"):
         points = [(lonlat[axis] - coordinate._asdict()[axis])
                   .abs().nsmallest(2).index.to_list()
                   for axis in _AXES]
@@ -261,10 +263,10 @@ def _setup_argparse():
                     "'./<station-file>.<variable-file>[.missing].csv'")
     output_args.add_argument("-op", "--output-prefix",
                              help="Prefix to use when writing output results. "
-                                  "[default='./<station-file>'")
+                                  "Default='./<station-file>'")
     output_args.add_argument("-os", "--output-suffix",
                              help="Suffix to use when writing output results. "
-                                  "[default='<variable-file>'")
+                                  "Default='<variable-file>[.<year>][.month]'")
 
     parser.add_argument("-x", "--multiprocess", action="store_true",
                         help="Enable parallel multiprocessing. May increase speed. May "
