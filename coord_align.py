@@ -5,14 +5,16 @@ Author: T.D. Medina
 """
 
 import argparse
-from itertools import product
+from functools import partial
+from itertools import product, batched
+from multiprocessing import set_start_method, Pool
 from pathlib import Path
-from warnings import warn
 
-import numpy as np
 import pandas as pd
 from pandas import IndexSlice as idx
 
+from shared_memory_arrays import SharedPandasDataFrame
+from tqdm import tqdm
 
 class CustomHelp(argparse.HelpFormatter):
     """Custom help formatter_class that only displays metavar once."""
@@ -40,83 +42,189 @@ class CustomHelp(argparse.HelpFormatter):
         return parts
 
 
-def read_coord_data(file_path, variable_name, year, month):
+set_start_method("fork")
+_AXES = ["lon", "lat"]
+
+
+def _date_option_fixer(date_opt):
+    if date_opt is None:
+        return slice(None)
+    if isinstance(date_opt, list):
+        return date_opt
+    if isinstance(date_opt, int):
+        return [date_opt]
+    if isinstance(date_opt, tuple):
+        return list(date_opt)
+    raise TypeError(f"Unexpected type ({type(date_opt)}) for date variable: {date_opt}")
+
+
+def read_coord_data(file_path, year=None, month=None):
     """Read variable data."""
     coord_data = pd.read_csv(file_path, sep=",")
-    coord_data.set_index(["Year", "Month"], inplace=True)
-    coord_data = coord_data.loc[idx[year, month],].reset_index(drop=True)
-    coord_data = coord_data.sort_values("lat").sort_values("lon")
-    axes = ["lon", "lat"]
-    for axis in axes:
-        axis_table = pd.DataFrame(coord_data[axis].unique(), columns=[axis])
-        axis_table.index.name = axis + "_index"
-        axis_table.reset_index(inplace=True)
-        coord_data = coord_data.merge(axis_table, on=axis)
-    coord_data = coord_data[["lon", "lat", variable_name, "lon_index", "lat_index"]]
-    coord_data.set_index(["lon_index", "lat_index"], inplace=True)
+    if "Year" not in coord_data.columns:
+        coord_data["Year"] = 0
+    if "Month" not in coord_data.columns:
+        coord_data["Month"] = 0
+    coord_data = (coord_data.set_index(["Year", "Month", "lon", "lat"])
+                  .sort_index())
+    if year is None and month is None:
+        return coord_data
+    year, month = _date_option_fixer(year), _date_option_fixer(month)
+    coord_data = coord_data.loc[idx[year, month, :, :],]
     return coord_data
 
 
-def read_station_table(file_path, index_column=0):
+def read_station_table(file_path):
     """Read survey positions."""
-    station_table = pd.read_csv(file_path, index_col=index_column)
+    station_table = pd.read_csv(file_path)
+    station_table.set_index(["lon", "lat"], inplace=True)
     return station_table
+
+
+def _average_closest_subtask(coordinates: list,
+                             coord_table: SharedPandasDataFrame,
+                             lonlat: dict,
+                             variable_name: str):
+    """Find the coordinate grid tile of each survey coordinate and assign mean value.
+
+    This is a subtask intended for multiprocessing with shared memory locations.
+    """
+    coord_table = coord_table.read()
+    lonlat = {axis: shared_df.read() for axis, shared_df in lonlat.items()}
+    results, missing, incomplete = [], [], []
+    setsize = {4}
+
+    for coordinate in coordinates:
+        points = [(lonlat[axis] - coordinate[axis])
+                  .abs().nsmallest(2, axis).index.to_list()
+                  for axis in _AXES]
+
+        try:
+            result = [coord_table.loc[idx[:, :, point[0], point[1]],]
+                      for point in product(*points)]
+        except KeyError:
+            missing.append(coordinate)
+            continue
+
+        result = pd.concat(result).groupby(["Year", "Month"])
+        if set(result.size()) != setsize:
+            incomplete.append(coordinate)
+            continue
+
+        result = pd.concat([result.mean(), result.max() - result.min()],
+                           axis=1)
+        result.columns = [f"{variable_name}_mean", f"{variable_name}_range"]
+        result["lon"], result["lat"] = coordinate["lon"], coordinate["lat"]
+        result = result.reset_index().set_index(_AXES)
+        results.append(result)
+    results = pd.concat(results)
+    missing = pd.DataFrame(missing)
+    if not missing.empty:
+        missing.set_index(_AXES, inplace=True)
+    incomplete = pd.DataFrame(incomplete)
+    if not incomplete.empty:
+        incomplete.set_index(_AXES, inplace=True)
+    return results, missing, incomplete
+
+
+def _average_closest_multiprocess(station_table, coordinate_data, variable_name,
+                                  subtask_length=None):
+    """Find the coordinate grid tile of each survey coordinate and assign mean value.
+
+    This function utilizes multiprocessing and shared memory locations to parallel
+    process the data without terrible overhead.
+    """
+    lonlat = {axis: coordinate_data.index.unique(axis).to_frame() for axis in _AXES}
+    coordinates = [coord._asdict() for coord
+                   in station_table.reset_index()[_AXES].itertuples(index=False)]
+    if subtask_length is None:
+        subtask_length = len(coordinates) // 8 + 1
+    coordinates = batched(coordinates, subtask_length)
+    try:
+        coordinate_data = SharedPandasDataFrame(coordinate_data)
+        lonlat = {axis: SharedPandasDataFrame(frame) for axis, frame in lonlat.items()}
+
+        with Pool() as pool:
+            func = partial(_average_closest_subtask,
+                           coord_table=coordinate_data,
+                           lonlat=lonlat,
+                           variable_name=variable_name)
+            results = list(pool.imap_unordered(func, coordinates))
+    finally:
+        coordinate_data.unlink()
+        for thing in lonlat.values():
+            thing.unlink()
+    results = [pd.concat([result[i] for result in results]) for i in range(3)]
+    for i, result in enumerate(results):
+        if result.empty and result.index.empty:
+            continue
+        results[i] = result.merge(station_table, left_index=True, right_index=True)
+    return results
 
 
 def average_closest(station_table, coordinate_data, variable_name):
     """Find the coordinate grid tile of each survey coordinate and assign mean value."""
-    results = []
-    warns = []
-    for coordinate in station_table.itertuples():
-        diff_table = np.abs(coordinate_data[["lon", "lat"]]
-                            - (coordinate.lon, coordinate.lat))
-        points = [diff_table[axis]
-                  .drop_duplicates()
-                  .nsmallest(2)
-                  .index.get_level_values(axis+"_index")
-                  .to_list()
-                  for axis in ["lon", "lat"]]
+    results, missing, incomplete = [], [], []
+    setsize = {4}
+    total = station_table.shape[0]
+    lonlat = {axis: coordinate_data.index.unique(axis).to_series() for axis in _AXES}
+    for i, coordinate in tqdm(enumerate(station_table.reset_index().itertuples()),
+                              desc=f"Locating stations", total=total,
+                              unit="Station"):
+        points = [(lonlat[axis] - coordinate._asdict()[axis])
+                  .abs().nsmallest(2).index.to_list()
+                  for axis in _AXES]
+
         try:
-            result = pd.DataFrame([coordinate_data.loc[idx[point],]
-                                   for point in product(*points)])
-        except KeyError as errkey:
-            warns.append(coordinate)
+            result = [coordinate_data.loc[idx[:, :, point[0], point[1]],]
+                      for point in product(*points)]
+        except KeyError:
+            missing.append(coordinate)
             continue
-        points = sorted(result[["lon", "lat"]].itertuples(index=False, name=None))
-        results.append([coordinate.Index, coordinate.lon, coordinate.lat, *points,
-                        result[variable_name].mean(),
-                        result[variable_name].max() - result[variable_name].min()])
-    results = pd.DataFrame(results,
-                           columns=[station_table.index.name, "lon", "lat",
-                                    "vertex1", "vertex2", "vertex3", "vertex4",
-                                    f"{variable_name}_mean", f"{variable_name}_range"])
-    results.set_index(station_table.index.name, inplace=True)
-    if warns:
-        warn(f"Missing measurement at {len(warns)} coordinates.")
-        warns = pd.DataFrame(warns)
-        warns.set_index("Index", inplace=True)
-        warns.index.name = station_table.index.name
-    else:
-        warns = None
-    return results, warns
+
+        result = pd.concat(result).groupby(["Year", "Month"])
+        if set(result.size()) != setsize:
+            incomplete.append(coordinate)
+            continue
+
+        result = pd.concat([result.mean(), result.max() - result.min()],
+                           axis=1)
+        result.columns = [f"{variable_name}_mean", f"{variable_name}_range"]
+        result["lon"], result["lat"] = coordinate.lon, coordinate.lat
+        result = result.reset_index().set_index(_AXES)
+        results.append(result)
+    results = pd.concat(results).merge(station_table, left_index=True, right_index=True)
+    missing = pd.DataFrame(missing)
+    if not missing.empty:
+        missing.set_index(_AXES, inplace=True)
+    incomplete = pd.DataFrame(incomplete)
+    if not incomplete.empty:
+        incomplete.set_index(_AXES, inplace=True)
+    return results, missing, incomplete
 
 
 def main(station_data_file, measurement_data_file, variable_name,
-         measurement_data_year, measurement_data_month,
-         station_index_col=0, output_prefix=None, output_suffix=None):
+         variable_year=None, variable_month=None,
+         output_prefix=None, output_suffix=None,
+         multiprocess=False):
     if output_prefix is None:
         output_prefix = Path(station_data_file).stem
         output_suffix = Path(measurement_data_file).stem
-    stations = read_station_table(station_data_file, station_index_col)
-    data = read_coord_data(measurement_data_file, variable_name, measurement_data_year,
-                           measurement_data_month)
-    closest, warns = average_closest(stations, data, variable_name=variable_name)
-    stations = stations.merge(closest.drop(["lon", "lat"], axis=1),
-                              left_index=True, right_index=True)
-    stations.to_csv(".".join([output_prefix, output_suffix, "csv"]), index=True)
-    warns.to_csv(".".join([output_prefix, output_suffix, "missing", "csv"]),
-                 index=True)
-    return stations, warns
+    stations = read_station_table(station_data_file)
+    data = read_coord_data(measurement_data_file, variable_year, variable_month)
+    if multiprocess:
+        results, missing, incomplete = _average_closest_multiprocess(stations, data,
+                                                                     variable_name)
+    else:
+        results, missing, incomplete = average_closest(stations, data, variable_name)
+    results.to_csv(".".join([output_prefix, output_suffix, "csv"]), index=True)
+    if not missing.empty:
+        missing.to_csv(".".join([output_prefix, output_suffix, "missing", "csv"]),
+                     index=True)
+    if not incomplete.empty:
+        incomplete.to_csv(".".join([output_prefix, output_suffix, "incomplete", "csv"]),
+                          index=True)
+    return results, missing, incomplete
 
 
 def _setup_argparse():
@@ -126,31 +234,28 @@ def _setup_argparse():
     station_args.add_argument("-s", "--station-file", required=True,
                               dest="station_data_file",
                               help="File path to station CSV file. Must have columns "
-                                   "called 'lon' and 'lat', as well as a column with a "
-                                   "unique index per row. Additional columns are "
+                                   "called 'lon' and 'lat'. Additional columns are "
                                    "allowed but must not match columns in the desired "
                                    "variable data CSV.")
-    station_args.add_argument("-i", "--index-col", type=int, dest="station_index_col",
-                              help="Integer corresponding to the column number ("
-                                   "zero-indexed) of the index column in the station "
-                                   "CSV file. [default=0]")
 
     variable_args = parser.add_argument_group(title="Variable Data")
-    variable_args.add_argument("-d", "--variable-data-file", required=True,
+    variable_args.add_argument("-v", "--variable-data-file", required=True,
                                dest="measurement_data_file",
                                help="File path to variable CSV file. Must have columns "
-                                    "called 'lon', 'lat', 'Year', and 'Month' as well "
-                                    "as a column with the desired variable measurement. "
-                                    "Additional columns are ignored.")
-    variable_args.add_argument("-v", "--variable", required=True,
+                                    "called 'lon' and 'lat' as well as a column with "
+                                    "the desired variable measurement. Additional "
+                                    "columns are ignored.")
+    variable_args.add_argument("-vn", "--variable-name", required=True,
                                dest="variable_name",
                                help="Name of the desired variable column.")
-    variable_args.add_argument("-y", "--year", required=True, type=int,
-                               dest="measurement_data_year",
-                               help="Year to subset data.")
-    variable_args.add_argument("-m", "--month", required=True, type=int,
-                               dest="measurement_data_month",
-                               help="Month to subset data.")
+    variable_args.add_argument("-y", "--year", type=int,
+                               dest="variable_year", nargs="*",
+                               help="Subset variable data to only these years. Multiple "
+                                    "years are allowed, space-separated.")
+    variable_args.add_argument("-m", "--month", type=int,
+                               dest="variable_month", nargs="*",
+                               help="Subset variable data to only these months. "
+                                    "Multiple months are allowed, space-separated.")
 
     output_args = parser.add_argument_group(
         title="Output Options",
@@ -158,10 +263,14 @@ def _setup_argparse():
                     "'./<station-file>.<variable-file>[.missing].csv'")
     output_args.add_argument("-op", "--output-prefix",
                              help="Prefix to use when writing output results. "
-                                  "[default='./<station-file>'")
+                                  "Default='./<station-file>'")
     output_args.add_argument("-os", "--output-suffix",
                              help="Suffix to use when writing output results. "
-                                  "[default='<variable-file>'")
+                                  "Default='<variable-file>[.<year>][.month]'")
+
+    parser.add_argument("-x", "--multiprocess", action="store_true",
+                        help="Enable parallel multiprocessing. May increase speed. May "
+                             "not work on Windows operating systems.")
     return parser
 
 
