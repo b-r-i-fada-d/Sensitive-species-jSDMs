@@ -164,7 +164,7 @@ def _average_closest_multiprocess(station_table, coordinate_data, variable_name,
 
 def average_closest(station_table, coordinate_data, variable_name):
     """Find the coordinate grid tile of each survey coordinate and assign mean value."""
-    results, missing, incomplete = [], [], []
+    results, missing = [], []
     setsize = {4}
     total = station_table.shape[0]
     lonlat = {axis: coordinate_data.index.unique(axis).to_series() for axis in _AXES}
@@ -183,13 +183,10 @@ def average_closest(station_table, coordinate_data, variable_name):
             continue
 
         result = pd.concat(result).groupby(["Year", "Month"])
-        if set(result.size()) != setsize:
-            incomplete.append(coordinate)
-            continue
-
-        result = pd.concat([result.mean(), result.max() - result.min()],
+        result = pd.concat([result.mean(), result.max() - result.min(), result.size()],
                            axis=1)
-        result.columns = [f"{variable_name}_mean", f"{variable_name}_range"]
+        result.columns = [f"{variable_name}_mean", f"{variable_name}_range",
+                          f"{variable_name}_pointcount"]
         result["lon"], result["lat"] = coordinate.lon, coordinate.lat
         result = result.reset_index().set_index(_AXES)
         results.append(result)
@@ -197,10 +194,7 @@ def average_closest(station_table, coordinate_data, variable_name):
     missing = pd.DataFrame(missing)
     if not missing.empty:
         missing.set_index(_AXES, inplace=True)
-    incomplete = pd.DataFrame(incomplete)
-    if not incomplete.empty:
-        incomplete.set_index(_AXES, inplace=True)
-    return results, missing, incomplete
+    return results, missing
 
 
 def main(station_data_file, measurement_data_file, variable_name,
@@ -216,15 +210,12 @@ def main(station_data_file, measurement_data_file, variable_name,
         results, missing, incomplete = _average_closest_multiprocess(stations, data,
                                                                      variable_name)
     else:
-        results, missing, incomplete = average_closest(stations, data, variable_name)
+        results, missing = average_closest(stations, data, variable_name)
     results.to_csv(".".join([output_prefix, output_suffix, "csv"]), index=True)
     if not missing.empty:
         missing.to_csv(".".join([output_prefix, output_suffix, "missing", "csv"]),
                      index=True)
-    if not incomplete.empty:
-        incomplete.to_csv(".".join([output_prefix, output_suffix, "incomplete", "csv"]),
-                          index=True)
-    return results, missing, incomplete
+    return results, missing
 
 
 def _setup_argparse():
