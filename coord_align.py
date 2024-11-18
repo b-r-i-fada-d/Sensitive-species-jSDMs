@@ -168,6 +168,8 @@ def average_closest(station_table, coordinate_data, variable_name):
     setsize = {4}
     total = station_table.shape[0]
     lonlat = {axis: coordinate_data.index.unique(axis).to_series() for axis in _AXES}
+    existing_coords = coordinate_data.reset_index(["Year", "Month"]).index
+    existing_coords = existing_coords.sort_values()
     for i, coordinate in tqdm(enumerate(station_table.reset_index().itertuples()),
                               desc=f"Locating stations", total=total,
                               unit="Station"):
@@ -175,12 +177,20 @@ def average_closest(station_table, coordinate_data, variable_name):
                   .abs().nsmallest(2).index.to_list()
                   for axis in _AXES]
 
-        try:
-            result = [coordinate_data.loc[idx[:, :, point[0], point[1]],]
-                      for point in product(*points)]
-        except KeyError:
+        # try:
+        #     result = [coordinate_data.loc[idx[:, :, point[0], point[1]],]
+        #               for point in product(*points)]
+
+        result = [coordinate_data.loc[idx[:, :, point[0], point[1]],]
+                  for point in product(*points)
+                  if point in existing_coords]
+        if not result:
             missing.append(coordinate)
             continue
+        # except KeyError:
+        #     missing.append(coordinate)
+        #     continue
+
 
         result = pd.concat(result).groupby(["Year", "Month"])
         result = pd.concat([result.mean(), result.max() - result.min(), result.size()],
@@ -190,7 +200,10 @@ def average_closest(station_table, coordinate_data, variable_name):
         result["lon"], result["lat"] = coordinate.lon, coordinate.lat
         result = result.reset_index().set_index(_AXES)
         results.append(result)
-    results = pd.concat(results).merge(station_table, left_index=True, right_index=True)
+    if results:
+        results = pd.concat(results).merge(station_table, left_index=True, right_index=True)
+    else:
+        results = pd.DataFrame()
     missing = pd.DataFrame(missing)
     if not missing.empty:
         missing.set_index(_AXES, inplace=True)
@@ -211,7 +224,8 @@ def main(station_data_file, measurement_data_file, variable_name,
                                                                      variable_name)
     else:
         results, missing = average_closest(stations, data, variable_name)
-    results.to_csv(".".join([output_prefix, output_suffix, "csv"]), index=True)
+    if not results.empty:
+        results.to_csv(".".join([output_prefix, output_suffix, "csv"]), index=True)
     if not missing.empty:
         missing.to_csv(".".join([output_prefix, output_suffix, "missing", "csv"]),
                      index=True)
